@@ -4,6 +4,10 @@ SAM3_PCS::SAM3_PCS(const std::string engine_path, const float vis_alpha, const f
     : _engine_path(engine_path)
     , _overlay_alpha(vis_alpha)
     , _probability_threshold(prob_threshold)
+    , opencv_input(nullptr)
+    , gpu_result(nullptr)
+    , zc_input(nullptr)
+    , opencv_inbytes(0)
 {
 
     cuda_check(cudaStreamCreate(&sam3_stream), "creating CUDA stream for SAM3");
@@ -21,6 +25,47 @@ SAM3_PCS::SAM3_PCS(const std::string engine_path, const float vis_alpha, const f
     bsize.y=16;
 }
 
+std::pair<cv::Mat, std::shared_ptr<void>> SAM3_PCS::allocate_pinned_mat(int rows, int cols, int type)
+{
+    size_t bytes = rows * cols * CV_ELEM_SIZE(type);
+    void* ptr = nullptr;
+    
+    cuda_check(cudaMallocHost(&ptr, bytes), " allocating pinned memory for Mat");
+    
+    auto deleter = [](void* p) { if (p) cudaFreeHost(p); };
+    std::shared_ptr<void> mem_holder(ptr, deleter);
+    
+    cv::Mat mat(rows, cols, type, ptr);
+    
+    return std::make_pair(mat, mem_holder);
+}
+
+void SAM3_PCS::setup_pinned_matrices(cv::Mat& input_mat, cv::Mat& result_mat)
+{
+    opencv_inbytes = input_mat.total() * input_mat.elemSize();
+    
+    if (is_zerocopy)
+    {
+        cuda_check(cudaHostGetDevicePointer(&zc_input, input_mat.data, 0),
+            " getting GPU pointer for pinned input Mat");
+        
+        cuda_check(cudaHostGetDevicePointer(&gpu_result, result_mat.data, 0),
+            " getting GPU pointer for pinned result Mat");
+    }
+    else
+    {
+        if (opencv_input != nullptr)
+        {
+            cudaFree(opencv_input);
+            cudaFree((void*)gpu_result);
+        }
+        cuda_check(cudaMalloc(&opencv_input, opencv_inbytes), " allocating opencv input memory on a dGPU system");
+        cuda_check(cudaMalloc((void**)&gpu_result, opencv_inbytes), " allocating result memory on a dGPU system");
+        cudaMemset(opencv_input, 0, opencv_inbytes);
+        cudaMemset((void *)gpu_result, 0, opencv_inbytes);
+    }
+}
+
 void SAM3_PCS::pin_opencv_matrices(cv::Mat& input_mat, cv::Mat& result_mat)
 {
     opencv_inbytes = input_mat.total() * input_mat.elemSize();
@@ -31,8 +76,6 @@ void SAM3_PCS::pin_opencv_matrices(cv::Mat& input_mat, cv::Mat& result_mat)
             cudaHostRegisterDefault),
             " pinning opencv input Mat on host"
         );
-    // for most purposes the default flag is good enough, in my benchmarking
-    // using others say readonly flag did not improve performance
 
     if (is_zerocopy)
     {
@@ -53,9 +96,8 @@ void SAM3_PCS::pin_opencv_matrices(cv::Mat& input_mat, cv::Mat& result_mat)
     }
     else
     {
-        // on dGPU allocate additional memory for input
         cuda_check(cudaMalloc(&opencv_input, opencv_inbytes), " allocating opencv input memory on a dGPU system");
-        cuda_check(cudaMalloc((void**)&gpu_result, opencv_inbytes), " allocating result memory on a dGPU system");        
+        cuda_check(cudaMalloc((void**)&gpu_result, opencv_inbytes), " allocating result memory on a dGPU system");
         cudaMemset(opencv_input, 0, opencv_inbytes);
         cudaMemset((void *)gpu_result, 0, opencv_inbytes);
     }
@@ -99,11 +141,11 @@ void SAM3_PCS::visualize_on_dGPU(const cv::Mat& input, cv::Mat& result, SAM3_VIS
 
         igsize.x = (input.cols + THREAD_COARSENING_FACTOR*ibsize.x - 1) / (THREAD_COARSENING_FACTOR*ibsize.x);
         igsize.y = (input.rows + THREAD_COARSENING_FACTOR*ibsize.y - 1) / (THREAD_COARSENING_FACTOR*ibsize.y);
-        // 2D grid
 
+        size_t input_bytes = input.total() * input.elemSize();
         cuda_check(cudaMemcpyAsync((void *)gpu_result, 
             (void *)input_ptr, 
-            opencv_inbytes, 
+            input_bytes, 
             cudaMemcpyDeviceToDevice, 
             sam3_stream), " async memcpy for result during instance seg visualization");
 
@@ -127,31 +169,47 @@ void SAM3_PCS::visualize_on_dGPU(const cv::Mat& input, cv::Mat& result, SAM3_VIS
 
     if (!is_zerocopy && vis_type == SAM3_VISUALIZATION::VIS_NONE)
     {
-        cudaMemcpyAsync(output_cpu[0], output_gpu[0],output_sizes[0], cudaMemcpyDeviceToHost, sam3_stream);
-        cudaMemcpyAsync(output_cpu[1], output_gpu[1],output_sizes[1], cudaMemcpyDeviceToHost, sam3_stream);
+        cudaMemcpyAsync(output_cpu[0], output_gpu[0], output_sizes[0], cudaMemcpyDeviceToHost, sam3_stream);
+        cudaMemcpyAsync(output_cpu[1], output_gpu[1], output_sizes[1], cudaMemcpyDeviceToHost, sam3_stream);
     }
     else if (!is_zerocopy)
     {
-        cudaMemcpyAsync(
-            (void*)result.data, 
-            (void*)gpu_result, 
-            opencv_inbytes, 
-            cudaMemcpyDeviceToHost, 
-            sam3_stream);
+        size_t result_bytes = result.total() * result.elemSize();
+        cudaMemcpyAsync((void*)result.data, (void*)gpu_result, result_bytes, cudaMemcpyDeviceToHost, sam3_stream);
     }
-
-    // if is_zerocopy, there is no need to do any synchronization/copy
-    // to make the result visible to the CPU
 }
 
 bool SAM3_PCS::infer_on_dGPU(const cv::Mat& input, cv::Mat& result, SAM3_VISUALIZATION vis_type)
 {
+    if (input.cols % 2 != 0 || input.rows % 2 != 0)
+    {
+        std::stringstream err;
+        err << "Error: Input image dimensions must be even. Current size: " 
+            << input.cols << "x" << input.rows 
+            << ". Please resize the image to even dimensions before inference.";
+        throw std::runtime_error(err.str());
+    }
+    
+    size_t current_inbytes = input.total() * input.elemSize();
+    
+    if (current_inbytes > opencv_inbytes)
+    {
+        if (opencv_input != nullptr)
+        {
+            cudaFree(opencv_input);
+            cudaFree((void*)gpu_result);
+        }
+        opencv_inbytes = current_inbytes;
+        cuda_check(cudaMalloc(&opencv_input, opencv_inbytes), " reallocating opencv input memory");
+        cuda_check(cudaMalloc((void**)&gpu_result, opencv_inbytes), " reallocating result memory");
+    }
+    
     gsize.x = (in_width + bsize.x - 1) / (THREAD_COARSENING_FACTOR*bsize.x);
     gsize.y = (in_height + bsize.y - 1) / (THREAD_COARSENING_FACTOR*bsize.y);
 
     cuda_check(
         cudaMemcpyAsync(
-            opencv_input, input.data, opencv_inbytes, cudaMemcpyHostToDevice, sam3_stream)
+            opencv_input, input.data, current_inbytes, cudaMemcpyHostToDevice, sam3_stream)
         , " async memcpy of opencv image");
 
     pre_process_sam3<<<gsize, bsize, 0, sam3_stream>>>(
@@ -172,6 +230,15 @@ bool SAM3_PCS::infer_on_dGPU(const cv::Mat& input, cv::Mat& result, SAM3_VISUALI
 
 bool SAM3_PCS::infer_on_iGPU(const cv::Mat& input, cv::Mat& result, SAM3_VISUALIZATION vis_type)
 {
+    if (input.cols % 2 != 0 || input.rows % 2 != 0)
+    {
+        std::stringstream err;
+        err << "Error: Input image dimensions must be even. Current size: " 
+            << input.cols << "x" << input.rows 
+            << ". Please resize the image to even dimensions before inference.";
+        throw std::runtime_error(err.str());
+    }
+    
     gsize.x = (in_width + bsize.x - 1) / (THREAD_COARSENING_FACTOR*bsize.x);
     gsize.y = (in_height + bsize.y - 1) / (THREAD_COARSENING_FACTOR*bsize.y);
 
@@ -187,7 +254,7 @@ bool SAM3_PCS::infer_on_iGPU(const cv::Mat& input, cv::Mat& result, SAM3_VISUALI
     bool res = trt_ctx->enqueueV3(sam3_stream);
     visualize_on_dGPU(input, result, vis_type);
     cudaStreamSynchronize(sam3_stream);
-
+    
     return res;
 }
 
@@ -371,6 +438,29 @@ SAM3_PCS::~SAM3_PCS()
         if (ptr)
         {
             cudaFree(ptr);
+        }
+    }
+    
+    if (is_zerocopy)
+    {
+        if (opencv_input != nullptr)
+        {
+            cudaFreeHost(opencv_input);
+        }
+        if (gpu_result != nullptr)
+        {
+            cudaFreeHost(static_cast<void*>(gpu_result));
+        }
+    }
+    else
+    {
+        if (opencv_input != nullptr)
+        {
+            cudaFree(opencv_input);
+        }
+        if (gpu_result != nullptr)
+        {
+            cudaFree(static_cast<void*>(gpu_result));
         }
     }
 }

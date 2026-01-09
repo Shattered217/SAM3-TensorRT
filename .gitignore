@@ -1,2 +1,7 @@
 *.DS_Store
 *build
+
+onnx_weights/
+__pycache__/
+
+*.plan

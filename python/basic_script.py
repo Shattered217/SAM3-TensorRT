@@ -14,8 +14,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 prompt='snow'
 benchmark = True
 
-model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-processor = Sam3Processor.from_pretrained("facebook/sam3")
+local_model_path = "./sam3"
+model = Sam3Model.from_pretrained(local_model_path).to(device)
+processor = Sam3Processor.from_pretrained(local_model_path)
+#model = Sam3Model.from_pretrained("facebook/sam3").to(device)
+#processor = Sam3Processor.from_pretrained("facebook/sam3")
 indir = sys.argv[1]
 
 num_frames_read=0

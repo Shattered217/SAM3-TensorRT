@@ -13,6 +13,7 @@ Export Meta AI's Segment Anything 3 (SAM3) model to ONNX, then build a TensorRT 
   - [Quickstart](#quickstart)
     - [On x86](#on-x86)
     - [On Jetson/Spark](#on-jetsonspark)
+  - [Jetson Orin 中文教程](#jetson-orin-中文教程)
   - [Extensions](#extensions)
   - [Troubleshooting](#troubleshooting)
   - [Development guide](#development-guide)
@@ -147,6 +148,14 @@ make
 ```
 
 Results are written to a `results/` folder.
+
+## Jetson Orin 中文教程
+
+在 Jetson Orin 上部署并加速本项目的详细步骤（Docker 构建、ONNX 导出、TensorRT 引擎生成、零拷贝优化等），请参考以下中文教程：
+
+- 教程链接：https://nvcc-v.com/2026/01/10/jetson-orin-tensorrt-sam3-tutorial/
+
+建议结合本仓库的 Quickstart 与该教程同步操作，以获得最佳部署体验。
 
 ## Extensions
 

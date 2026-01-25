@@ -7,8 +7,11 @@ import requests
 device = "cpu" # for onnx export we use CPU for maximum compatibility
 
 # 1. Load model & processor
-model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-processor = Sam3Processor.from_pretrained("facebook/sam3")
+local_model_path = "./sam3"
+model = Sam3Model.from_pretrained(local_model_path).to(device)
+processor = Sam3Processor.from_pretrained(local_model_path)
+#model = Sam3Model.from_pretrained("facebook/sam3").to(device)
+#processor = Sam3Processor.from_pretrained("facebook/sam3")
 
 model.eval()
 
